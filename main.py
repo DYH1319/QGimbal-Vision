@@ -34,28 +34,24 @@ DEFAULT_DISPLAY = 1
 
 # 控制默认参数（可通过命令行覆盖）
 DEFAULT_MAX_RPM = 20.0
-DEFAULT_DEADBAND_PX = 0.0
 DEFAULT_LOST_TIMEOUT_S = 0.4
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="OpenCV 摄像头显示示例")
     p.add_argument('--camera', type=int, default=DEFAULT_CAMERA, help=f'摄像头索引（默认 {DEFAULT_CAMERA}）')
-    p.add_argument('--display', type=bool, choices=[0, 1], default=DEFAULT_DISPLAY,
+    p.add_argument('--display', type=int, choices=[0, 1], default=DEFAULT_DISPLAY,
                    help=f'是否显示图形化窗口（0/1，默认 {DEFAULT_DISPLAY}）')
 
     # 控制相关
     p.add_argument('--max-rpm', type=float, default=DEFAULT_MAX_RPM,
                    help=f'最大转速输出（RPM，默认 {DEFAULT_MAX_RPM}）')
-    p.add_argument('--deadband-px', type=float, default=DEFAULT_DEADBAND_PX,
-                   help=f'像素死区（默认 {DEFAULT_DEADBAND_PX}）')
     p.add_argument('--lost-timeout', type=float, default=DEFAULT_LOST_TIMEOUT_S,
                    help=f'丢目标超时后复位控制器的时间（秒，默认 {DEFAULT_LOST_TIMEOUT_S}）')
     p.add_argument('--serial-port', type=str, default=None, help='串口端口号，例如 COM3；不填则不发送')
-    p.add_argument('--serial-baud', type=int, default=1152000, help='串口波特率（默认 1152000）')
+    p.add_argument('--serial-baud', type=int, default=115200, help='串口波特率（默认 115200）')
 
     return p.parse_args()
-
 
 
 def main():
@@ -71,23 +67,29 @@ def main():
     if not cap.isOpened():
         print(f"无法打开摄像头索引 {args.camera}. 请检查设备或更换索引。")
         sys.exit(2)
-    print(f"info: capture backend: {cap.getBackendName()}")
 
     # 设置参数
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, DEFAULT_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DEFAULT_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, DEFAULT_FPS)
+    print(f"info: capture backend: {cap.getBackendName()}")
+    print(f"info: capture resolution: {cap.get(cv2.CAP_PROP_FRAME_WIDTH)}x{cap.get(cv2.CAP_PROP_FRAME_HEIGHT)}")
+    print(f"info: capture FPS: {cap.get(cv2.CAP_PROP_FPS)}")
 
     # 控制器初始化
     tracker = GimbalTracker(
-        yaw_pid=PID(kp=4.0, ki=0.80, kd=0.08, integral_limit=0.2, output_limit=args.max_rpm),
-        pitch_pid=PID(kp=3.0, ki=0.6, kd=0.06, integral_limit=0.2, output_limit=args.max_rpm),
+        yaw_pid=PID(kp=150.0, ki=35.0, kd=2.4, integral_limit=0.18, output_limit=args.max_rpm),
+        pitch_pid=PID(kp=120.0, ki=20.0, kd=2.0, integral_limit=0.18, output_limit=args.max_rpm),
         lost_timeout_s=args.lost_timeout, invert_yaw=True
     )
-    serial_stub = GimbalSerialStub(port=args.serial_port, baudrate=int(args.serial_baud))
+    serial_stub = GimbalSerialStub(args.serial_port, args.serial_baud)
     feedbacker = Feedbacker(display=args.display)
     serial_stub.open()
 
+    tracker.enabled = True
+    serial_stub.send_command(serial_stub.CmdType.EnableLaser)  # 启用激光
+    serial_stub.send_command(serial_stub.CmdType.EnableStability)  # 启用陀螺仪稳定
+    serial_stub.send_command(serial_stub.CmdType.Enable)  # 启用云台
     try:
         while True:
             ret, frame = cap.read()
@@ -104,13 +106,13 @@ def main():
             best_rect_center = rects[0].center if rects else None
 
             # PID 控制：将目标中心追踪到屏幕中心，输出 yaw/pitch rpm
-            tracker.target_center = (0.0, 0.0)  # 屏幕中心, 单位: px
+            tracker.target_center = (frame.shape[:2][1] // 2 + 15, frame.shape[:2][0] // 2)  # 追踪目标, 单位: px
             error_pixel, yaw_pitch_rpm = tracker.update(frame.shape[:2], best_rect_center)
             if yaw_pitch_rpm is not None:
                 yaw_rpm, pitch_rpm = yaw_pitch_rpm
-                serial_stub.send_rpm(yaw_rpm, pitch_rpm)  # 发送转速到云台
+                serial_stub.send_command(serial_stub.CmdType.LowSpeedCtrl, (yaw_rpm, pitch_rpm))  # 发送转速到云台
 
-            feedbacker.update(frame, best_rect, error_pixel, yaw_pitch_rpm)
+            feedbacker.update(frame, best_rect, tracker.target_center, error_pixel, yaw_pitch_rpm)
 
     except KeyboardInterrupt:
         print('\n收到中断，退出...')

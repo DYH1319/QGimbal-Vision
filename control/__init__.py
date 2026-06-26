@@ -4,10 +4,14 @@ This package converts vision detections (target center in image coordinates) int
 control outputs (e.g., gimbal yaw/pitch speed in RPM).
 """
 
-from .config import ControlConfig
 from .tracker_control import GimbalTracker
+from .serial_stub import GimbalSerialStub
+from .feedbacker import Feedbacker
+from .pid import PID
 
 __all__ = [
-    "ControlConfig",
     "GimbalTracker",
+    "GimbalSerialStub",
+    "Feedbacker",
+    "PID",
 ]

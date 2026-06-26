@@ -1,96 +1,138 @@
-from __future__ import annotations
-
 import struct
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
+from enum import IntEnum
+from typing import Tuple
 
 
-def _checksum_mod_256(payload: bytes) -> int:
-    """Checksum: sum(all bytes) % 256."""
-    return sum(payload) & 0xFF
-
-
-@dataclass(slots=True)
+@dataclass()
 class GimbalSerialStub:
-    """Serial sender for STM32 gimbal.
+    port: str
+    baudrate: int
 
-    Packet format (little-endian, packed):
-        uint8  laser_enabled
-        uint8  enabled
-        uint8  stability_enabled
-        float  yaw_speed   (rpm)
-        float  pitch_speed (rpm)
-        uint8  check_sum   (sum of previous bytes % 256)
+    class CmdType(IntEnum):
+        NOP = 0x00,  # 无操作
+        Enable = 0x01,  # 使能
+        Disable = 0x02,  # 失能
+        CurrentCtrl = 0x03,  # 电流控制
+        SpeedCtrl = 0x04,  # 速度控制
+        AngleCtrl = 0x05,  # 角度控制
+        LowSpeedCtrl = 0x06,  # 低速控制
+        StepAngleCtrl = 0x07,  # 角度递增控制
 
-    Notes:
-        - This file is intentionally self-contained. Replace/extend as you like.
-        - Floats are IEEE754 32-bit; STM32 is little-endian.
-    """
+        EnableStability = 0xFF,  # 使能自稳
+        DisableStability = 0xFE,  # 失能自稳
+        EnableLaser = 0xFD,  # 使能激光
+        DisableLaser = 0xFC,  # 失能激光
+        ResetIMU = 0xFB,  # 复位IMU(角度调零)
 
-    port: Optional[str] = None
-    baudrate: int = 115200
-
-    # Enable fields: 0 disable, 1 enable, other no action
-    laser_enabled: int = 2
-    enabled: int = 1
-    stability_enabled: int = 2
-
-    _ser: object | None = field(default=None, init=False, repr=False)
+    def __post_init__(self) -> None:
+        self.enabled = False
+        self.laser_enabled = False
+        self.stability_enabled = False
+        self.imu_speed = 0, 0  # speed yaw, pitch in RPM
+        self.imu_angle = 0, 0  # angle yaw, pitch in rad
+        self.current = 0, 0  # current yaw, pitch in A
+        self.speed = 0, 0  # speed yaw, pitch in RPM
+        self.angle = 0, 0  # angle yaw, pitch in rad
+        self._ser = None
 
     def open(self) -> None:
-        """Open serial port.
-
-        If `port` is None, this remains a no-op (safe default).
-        """
         if self.port is None:
-            self._ser = None
             return
-
-        # Import lazily so the project still runs without pyserial installed
-        # when you don't use real serial.
-        import serial  # type: ignore
-
+        import serial
         self._ser = serial.Serial(
             port=self.port,
             baudrate=self.baudrate,
             timeout=0,
-            write_timeout=0,
+            write_timeout=0.01,
         )
 
     def close(self) -> None:
-        ser = self._ser
+        if self._ser is None:
+            return
+        self.send_command(self.CmdType.SpeedCtrl, (0, 0))
+        self._ser.close()
         self._ser = None
-        if ser is None:
+
+    def __del__(self):
+        self.close()
+
+    def send_command(self, cmd_type: CmdType, data: Tuple[float, float] = (0.0, 0.0)) -> None:
+        if self._ser is None:
             return
-        close = getattr(ser, "close", None)
-        if callable(close):
-            close()
-
-    def build_packet(self, yaw_rpm: float, pitch_rpm: float) -> bytes:
-        """Build a binary packet matching `ReceivePackage` (little-endian)."""
-        header = struct.pack(
-            "<ffBBB",
-            float(yaw_rpm),
-            float(pitch_rpm),
-            int(self.laser_enabled) & 0xFF,
-            int(self.enabled) & 0xFF,
-            int(self.stability_enabled) & 0xFF,
-        )
-        chk = _checksum_mod_256(header)
-        pkt = header + struct.pack("<B", chk)
-        return pkt
-
-    def send_rpm(self, yaw_rpm: float, pitch_rpm: float) -> None:
-        """Send RPM command.
-
-        Safe behavior:
-            - If serial isn't opened (or port is None), does nothing.
-        """
-        ser = self._ser
-        if ser is None:
+        pkt = struct.pack("<Bff", cmd_type, *data)
+        pkt = pkt + struct.pack("<B", crc8(pkt, polynomial=0x07, init=0x00, xor_out=0x00))
+        self._ser.write(pkt)
+        data = self._ser.read(42)
+        if len(data) == 42 and data[41] == crc8(data[:41], polynomial=0x07, init=0x00, xor_out=0x00):
+            # 解析数据
+            values = struct.unpack("<BffffffffffB", data)
+            state = values[0]
+            self.enabled = bool(state & 0x01)
+            self.stability_enabled = bool(state & 0x02)
+            self.laser_enabled = bool(state & 0x04)
+            self.imu_speed = values[1:3]
+            self.imu_angle = values[3:5]
+            self.angle = values[5:7]
+            self.speed = values[7:9]
+            self.current = values[9:11]
             return
+        else:
+            print(f"串口数据长度错误或 CRC 校验失败，收到 {len(data)} 字节数据: {data.hex()}")
 
-        pkt = self.build_packet(yaw_rpm, pitch_rpm)
-        write = getattr(ser, "write", None)
-        if callable(write):
-            write(pkt)
+
+def reverse_bits(data: int) -> int:
+    """反转一个字节的 bit 顺序"""
+    data &= 0xFF
+    data = ((data & 0x55) << 1) | ((data & 0xAA) >> 1)
+    data = ((data & 0x33) << 2) | ((data & 0xCC) >> 2)
+    data = ((data & 0x0F) << 4) | ((data & 0xF0) >> 4)
+    return data & 0xFF
+
+
+def crc8(
+        data: bytes | bytearray,
+        polynomial: int,
+        init: int,
+        xor_out: int,
+        input_invert: bool = False,
+        output_invert: bool = False,
+) -> int:
+    """
+    通用 CRC-8 计算
+
+    Args:
+        data: 输入数据
+        polynomial: CRC 多项式（例如 0x07）
+        init: 初始值
+        xor_out: 最终异或值
+        input_invert: 是否按 bit 反转每个输入字节
+        output_invert: 是否按 bit 反转最终 CRC
+
+    Returns:
+        CRC8 值（0~255）
+    """
+    if not data:
+        raise ValueError("data must not be empty")
+
+    crc = init & 0xFF
+
+    for byte in data:
+        if input_invert:
+            byte = reverse_bits(byte)
+
+        crc ^= byte
+
+        for _ in range(8):
+            if crc & 0x80:
+                crc = ((crc << 1) ^ polynomial) & 0xFF
+            else:
+                crc = (crc << 1) & 0xFF
+
+    crc ^= xor_out
+    crc &= 0xFF
+
+    if output_invert:
+        crc = reverse_bits(crc)
+
+    return crc

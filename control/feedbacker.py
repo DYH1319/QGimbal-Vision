@@ -11,14 +11,16 @@ from vision.rect_detect import draw_detected_rect
 def get_fps():
     if not hasattr(get_fps, "prev_time"):
         get_fps.prev_time = time.time()
+        return 0.0
     if not hasattr(get_fps, "fps"):
         get_fps.fps = 0
+        return 0.0
     now = time.time()
     dt = now - get_fps.prev_time
     get_fps.prev_time = now
     if dt > 0:
-        alpha = 0.98
-        inst_fps = 1.0 / dt
+        alpha = 0.95
+        inst_fps = 1.0 / max(dt, 1e-6)
         get_fps.fps = alpha * get_fps.fps + (1 - alpha) * inst_fps if get_fps.fps > 0 else inst_fps
     return get_fps.fps
 
@@ -41,18 +43,18 @@ class Feedbacker:
         self.__del__()
 
     def update(self, frame, rect,
+               center_pixel: Tuple[int, int],
                error_pixel: Tuple[float, float],
                yaw_pitch_rpm: Tuple[float, float] | None
                ) -> None:
         fps = get_fps()
+        err_x, err_y = error_pixel
+        yaw_rpm, pitch_rpm = yaw_pitch_rpm if yaw_pitch_rpm is not None else (0.0, 0.0)
         if self.display:
             if rect is not None:
                 draw_detected_rect(frame, rect)
-
-            err_x, err_y = error_pixel
-            yaw_rpm, pitch_rpm = yaw_pitch_rpm if yaw_pitch_rpm is not None else (0.0, 0.0)
             # 画面中心点
-            cv2.drawMarker(frame, frame.shape[:2] // 2, (255, 0, 0),
+            cv2.drawMarker(frame, center_pixel, (255, 0, 0),
                            markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
             cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
             cv2.putText(
@@ -65,18 +67,18 @@ class Feedbacker:
                 2,
             )
             cv2.imshow(self._window_name, frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("退出程序...")
+                exit(0)
         else:
             # 无窗口：终端输出 FPS + 检测结果
             if (time.time() - self._last_print) >= 0.05:
                 self._last_print = time.time()
                 if rect is None:
-                    print(f"fps={fps:.1f} rect=none rpm=({yaw_pitch_rpm[0]:.1f},{yaw_pitch_rpm[1]:.1f})")
+                    print(f"fps={fps:.1f} rect=none rpm=({yaw_rpm:.1f},{pitch_rpm:.1f})")
                 else:
                     cx, cy = rect.center
-                    area = rect.area
-                    err_x, err_y = error_pixel
-                    yaw_rpm, pitch_rpm = yaw_pitch_rpm
                     print(
-                        f"fps={fps:.1f} cx={cx:.1f} cy={cy:.1f} area={area:.0f} "
+                        f"fps={fps:.1f} cx={cx:.1f} cy={cy:.1f} area={rect.area:.0f} "
                         f"err=({err_x:.0f},{err_y:.0f}) rpm=({yaw_rpm:.1f},{pitch_rpm:.1f})"
                     )

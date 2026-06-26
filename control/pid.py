@@ -1,7 +1,4 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
-
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return lo if v < lo else hi if v > hi else v

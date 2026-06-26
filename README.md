@@ -1,62 +1,49 @@
-# Gimbal-vision
+# QGimbal-vision
 
-一个简单的 OpenCV 摄像头预览 + 矩形检测示例。
+QGimbal云台配套视觉程序。试用 OpenCV 库实现基于传统视觉算法的白色矩形检测，将误差进行PID计算后，通过UART向QGimbal发送指令实现目标追踪。
 
-## 结构
+## 运行步骤
 
-- `main.py`：摄像头采集 / FPS / 显示与输出
-- `vision/rect_detect.py`：矩形检测与绘制（已从 `main.py` 抽离）
+1. **克隆仓库**
 
-## 安装依赖
-
-```powershell
-pip install -r requirements.txt
+```bash
+sudo apt install git # 若未安装git，请先安装
+git clone https://github.com/Liu-Curiousity/QGimbal-Vision.git # 克隆仓库
+cd QGimbal-Vision # 进入仓库目录
 ```
 
-## 运行
+2. **安装依赖环境**
 
-GUI 模式（显示窗口，按 `q` 或 `ESC` 退出）：
-
-```powershell
-python main.py --camera 0 --display 1
+```bash
+pip install -r requirements.txt # 使用pip安装
+sudo apt install python3-opencv # 若pip安装opencv失败，可尝试apt安装
 ```
 
-无窗口模式（只在终端输出 FPS + 检测到的矩形中心点/面积，按 `Ctrl+C` 退出）：
+3. **运行程序**
 
-```powershell
-python main.py --camera 0 --display 0 --print-interval 0.5
+选择其中一种模式运行：
+
+- 窗口模式：显示摄像头图像，便于调试和观察识别效果，但帧率较低
+- 无窗口模式：不显示摄像头图像，进通过终端输出基本信息，帧率高
+
+**注意：** 
+  1. 若使用树莓派40P引脚中的串口，需先使用`raspi-config`工具启用串口（其他XX派开启方式类似，不再赘述）。若使用USB转TTL模块，请根据实际情况修改串口号。
+  2. 若使用SSH远程连接时选择窗口模式运行，请确保SSH客户端支持X11转发，并在连接时使用`ssh -X`参数。
+
+```bash
+# 窗口模式，使用串口ttyAMA0，按 `q` 或 `ESC` 退出
+python main.py --serial-port /dev/ttyAMA0 --display 1
+```
+
+```bash
+# 窗口模式，使用串口ttyAMA0，按 `Ctrl+C` 退出
+python main.py --serial-port /dev/ttyAMA0 --display 0
 ```
 
 ## 说明
 
-`vision.rect_detect.detect_rectangles()` 返回按面积从大到小排序的矩形列表；`main.py` 默认取第 1 个作为 `best`。
-
-## 追踪控制（PID）
-
-项目已加入一个“识别结果(cx,cy) → 双轴 PID → yaw/pitch 速度(rpm)”的控制模块：
-
-- `control/pid.py`：基础 PID（积分限幅/输出限幅）
-- `control/tracker_control.py`：将图像误差映射为 `yaw_rpm/pitch_rpm`
-- `control/serial_stub.py`：串口发送 stub（目前 no-op，协议部分你后续补上）
-
-### 坐标系约定
-
 - 图像坐标：x 向右为正，y 向下为正
-- 误差定义：`err = target_center - image_center`
-- 云台正方向未知时，可用 `ControlConfig.invert_yaw/invert_pitch` 反转输出方向
-
-### 运行示例
-
-启用控制输出（默认已启用），并设置最大输出 rpm / 死区：
-
-```powershell
-python main.py --camera 0 --display 1 --control 1 --max-rpm 120 --deadband-px 6
-```
-
-无窗口模式查看控制输出：
-
-```powershell
-python main.py --camera 0 --display 0 --control 1 --print-interval 0.1
-```
-
-> 注意：当前 `send_rpm()` 是空实现，不会实际控制云台。你把协议写好后，只需要替换 `control/serial_stub.py` 中的发送逻辑。
+- 误差定义：`err = current_center - target_center`
+- 若摄像头不在追踪目标处，可以更改`main.py`中的
+  `tracker.target_center = (frame.shape[:2][1] // 2 + 15, frame.shape[:2][0] // 2)`调整`target_center`，使其与摄像头实际位置一致。
+- 更多参数可使用`python main.py --help`查看
