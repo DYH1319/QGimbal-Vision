@@ -69,6 +69,7 @@ def main():
         sys.exit(2)
 
     # 设置参数
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G')) # 设置为 MJPG 格式
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, DEFAULT_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DEFAULT_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, DEFAULT_FPS)
@@ -78,8 +79,8 @@ def main():
 
     # 控制器初始化
     tracker = GimbalTracker(
-        yaw_pid=PID(kp=150.0, ki=35.0, kd=2.4, integral_limit=0.18, output_limit=args.max_rpm),
-        pitch_pid=PID(kp=120.0, ki=20.0, kd=2.0, integral_limit=0.18, output_limit=args.max_rpm),
+        yaw_pid=PID(kp=140.0, ki=40.0, kd=1.4, integral_limit=0.15, output_limit=args.max_rpm),
+        pitch_pid=PID(kp=140.0, ki=40.0, kd=1.4, integral_limit=0.15, output_limit=args.max_rpm),
         lost_timeout_s=args.lost_timeout, invert_yaw=True
     )
     serial_stub = GimbalSerialStub(args.serial_port, args.serial_baud)
@@ -106,7 +107,7 @@ def main():
             best_rect_center = rects[0].center if rects else None
 
             # PID 控制：将目标中心追踪到屏幕中心，输出 yaw/pitch rpm
-            tracker.target_center = (frame.shape[:2][1] // 2 + 15, frame.shape[:2][0] // 2)  # 追踪目标, 单位: px
+            tracker.target_center = (frame.shape[:2][1] // 2 + 10, frame.shape[:2][0] // 2)  # 追踪目标, 单位: px
             error_pixel, yaw_pitch_rpm = tracker.update(frame.shape[:2], best_rect_center)
             if yaw_pitch_rpm is not None:
                 yaw_rpm, pitch_rpm = yaw_pitch_rpm
