@@ -6,16 +6,17 @@
 参数：
   --camera        摄像头索引（默认 0）
   --display       是否显示图形化窗口（0/1，默认 1）
-                 - 1：显示图像（现有效果），并叠加矩形与 FPS
-                 - 0：不显示窗口，在终端输出 FPS + 检测到的矩形中心点坐标/面积
-  --print-interval 终端输出间隔秒数（仅 --display 0 时生效，默认 0.5）
-  --manual        启动时进入键盘手动控制模式
-  --manual-rpm    手动模式转速（RPM）
+  --manual        启动时进入手动控制模式
+  --manual-rpm    手动模式转速上限（RPM）
+  --gamepad / --no-gamepad  启用/禁用 USB 手柄（默认启用并自动探测）
 
 控制：
   GUI 模式按 'q' 或 ESC 退出；无窗口模式请按 Ctrl+C 退出。
-  按 'm' 在自动追踪 / 手动控制之间切换（需 --display 1）。
-  手动模式：WASD 或方向键控制 yaw/pitch，空格急停。
+  按 'm' 或手柄 Start 在自动追踪 / 手动控制之间切换。
+  手动模式：
+    - 手柄左摇杆 / 方向键：yaw / pitch（比例控制）
+    - 手柄 A：急停；Back：退出
+    - 键盘 WASD / 方向键 / 空格（需 --display 1）
 """
 
 import argparse
@@ -31,6 +32,7 @@ from control.feedbacker import Feedbacker
 from control.serial_stub import GimbalSerialStub
 from control.tracker_control import GimbalTracker
 from control.manual_control import ManualController
+from control.gamepad_control import GamepadController
 
 DEFAULT_CAMERA = 0  # 摄像头索引（默认 0）
 DEFAULT_WIDTH = 640  # 期望宽度
@@ -42,6 +44,7 @@ DEFAULT_DISPLAY = 1
 DEFAULT_MAX_RPM = 20.0
 DEFAULT_LOST_TIMEOUT_S = 0.4
 DEFAULT_MANUAL_RPM = 1
+DEFAULT_GAMEPAD_DEADZONE = 0.12
 
 
 def parse_args():
@@ -57,9 +60,16 @@ def parse_args():
                    help=f'丢目标超时后复位控制器的时间（秒，默认 {DEFAULT_LOST_TIMEOUT_S}）')
     p.add_argument('--serial-port', type=str, default=None, help='串口端口号，例如 COM3；不填则不发送')
     p.add_argument('--serial-baud', type=int, default=115200, help='串口波特率（默认 115200）')
-    p.add_argument('--manual', action='store_true', help='启动时进入键盘手动控制模式')
+    p.add_argument('--manual', action='store_true', help='启动时进入手动控制模式')
     p.add_argument('--manual-rpm', type=float, default=DEFAULT_MANUAL_RPM,
                    help=f'手动模式转速（RPM，默认 {DEFAULT_MANUAL_RPM}）')
+    p.add_argument('--gamepad', dest='gamepad', action='store_true', default=True,
+                   help='启用 USB 手柄（默认开启）')
+    p.add_argument('--no-gamepad', dest='gamepad', action='store_false',
+                   help='禁用 USB 手柄')
+    p.add_argument('--gamepad-index', type=int, default=0, help='手柄设备索引（默认 0）')
+    p.add_argument('--gamepad-deadzone', type=float, default=DEFAULT_GAMEPAD_DEADZONE,
+                   help=f'摇杆死区 0~1（默认 {DEFAULT_GAMEPAD_DEADZONE}）')
 
     return p.parse_args()
 
@@ -94,24 +104,50 @@ def main():
         lost_timeout_s=args.lost_timeout, invert_yaw=True
     )
     manual = ManualController(rpm=args.manual_rpm, invert_yaw=True)
+    gamepad = None
+    if args.gamepad:
+        gamepad = GamepadController(
+            index=args.gamepad_index,
+            rpm=args.manual_rpm,
+            deadzone=args.gamepad_deadzone,
+            invert_yaw=True,
+        )
+        if not gamepad.connected:
+            gamepad.close()
+            gamepad = None
+
     serial_stub = GimbalSerialStub(args.serial_port, args.serial_baud)
     feedbacker = Feedbacker(display=args.display)
     serial_stub.open()
 
     manual_mode = bool(args.manual)
-    if manual_mode and not args.display:
-        print("警告: 键盘手动控制需要 --display 1（OpenCV 窗口才能接收按键）")
+    if manual_mode and not args.display and gamepad is None:
+        print("警告: 无手柄且 --display 0 时无法接收键盘，请接入手柄或使用 --display 1")
 
     tracker.enabled = not manual_mode
     mode_name = "manual" if manual_mode else "auto"
-    print(f"info: control mode = {mode_name}  (按 m 切换，需 GUI)")
-    print("info: 手动键位 WASD/方向键，空格急停，q 退出")
+    print(f"info: control mode = {mode_name}  (键盘 m / 手柄 Start 切换)")
+    print("info: 手动: 手柄左摇杆 或 WASD；A/空格急停；q/Back 退出")
 
     serial_stub.send_command(serial_stub.CmdType.EnableLaser)  # 启用激光
     serial_stub.send_command(serial_stub.CmdType.EnableStability)  # 启用陀螺仪稳定
     serial_stub.send_command(serial_stub.CmdType.Enable)  # 启用云台
 
     key = 255
+
+    def toggle_manual_mode():
+        nonlocal manual_mode
+        manual_mode = not manual_mode
+        tracker.enabled = not manual_mode
+        tracker.reset()
+        manual.reset()
+        if gamepad is not None:
+            gamepad.reset()
+        serial_stub.send_command(serial_stub.CmdType.LowSpeedCtrl, (0.0, 0.0))
+        print(f"切换到 {'手动' if manual_mode else '自动追踪'} 模式")
+        if manual_mode and not args.display and gamepad is None:
+            print("警告: 当前无 GUI 且无手柄，无法接收控制输入")
+
     try:
         while True:
             ret, frame = cap.read()
@@ -122,6 +158,17 @@ def main():
 
             frame = cv2.flip(frame, -1)  # 翻转画面
 
+            gp_events = gamepad.update() if gamepad is not None else None
+            if gp_events is not None:
+                if gp_events.quit:
+                    print("手柄 Back：退出程序...")
+                    break
+                if gp_events.mode_toggle:
+                    toggle_manual_mode()
+                if gp_events.stop and manual_mode:
+                    manual.reset()
+                    serial_stub.send_command(serial_stub.CmdType.LowSpeedCtrl, (0.0, 0.0))
+
             # 对每帧执行矩形检测（自动模式用于追踪，手动模式仅用于叠加显示）
             rects = detect_rectangles(frame, min_area_ratio=0.005, max_area_ratio=0.5, angle_tol=25.0)
             best_rect = rects[0] if rects else None
@@ -131,7 +178,11 @@ def main():
 
             if manual_mode:
                 manual.handle_key(key)
-                yaw_rpm, pitch_rpm = manual.get_rpm()
+                key_rpm = manual.get_rpm()
+                if gamepad is not None and (gamepad.stick_active() or not any(key_rpm)):
+                    yaw_rpm, pitch_rpm = gamepad.get_rpm()
+                else:
+                    yaw_rpm, pitch_rpm = key_rpm
                 yaw_pitch_rpm = (yaw_rpm, pitch_rpm)
                 error_pixel = (0.0, 0.0)
                 serial_stub.send_command(serial_stub.CmdType.LowSpeedCtrl, yaw_pitch_rpm)
@@ -151,19 +202,14 @@ def main():
                 print("退出程序...")
                 break
             if key in (ord('m'), ord('M')):
-                manual_mode = not manual_mode
-                tracker.enabled = not manual_mode
-                tracker.reset()
-                manual.reset()
-                serial_stub.send_command(serial_stub.CmdType.LowSpeedCtrl, (0.0, 0.0))
-                print(f"切换到 {'手动' if manual_mode else '自动追踪'} 模式")
-                if manual_mode and not args.display:
-                    print("警告: 当前无 GUI，无法接收键盘；请使用 --display 1")
+                toggle_manual_mode()
 
     except KeyboardInterrupt:
         print('\n收到中断，退出...')
     finally:
         cap.release()
+        if gamepad is not None:
+            gamepad.close()
         serial_stub.close()
         feedbacker.close()
 

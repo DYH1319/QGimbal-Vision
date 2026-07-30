@@ -69,8 +69,8 @@ class Feedbacker:
                 (0, 255, 255),
                 2,
             )
-            hint = "m:mode  WASD/arrows:move  space:stop  q:quit" if mode == "manual" \
-                else "m:manual  q:quit"
+            hint = "Start/m:mode  stick/WASD:move  A/space:stop  Back/q:quit" if mode == "manual" \
+                else "Start/m:manual  Back/q:quit"
             cv2.putText(frame, hint, (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
             cv2.imshow(self._window_name, frame)
             # waitKeyEx：兼容方向键；无按键时可能为 -1
