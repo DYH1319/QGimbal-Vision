@@ -4,7 +4,7 @@
 """
 简单的摄像头预览脚本（使用 OpenCV）。
 参数：
-  --camera        摄像头索引（默认 0）
+  --camera / --fps / --width / --height  采集参数（默认 640x480 @ 60fps）
   --display       是否显示图形化窗口（0/1，默认 1）
   --manual        启动时进入手动控制模式
   --manual-rpm    手动模式转速上限（RPM）
@@ -17,6 +17,7 @@
     - 手柄左摇杆 / 方向键：yaw / pitch（比例控制）
     - 手柄 A：急停；Back：退出
     - 键盘 WASD / 方向键 / 空格（需 --display 1）
+  摄像头读帧连续失败时会自动 release 并重连。
 """
 
 import argparse
@@ -37,8 +38,10 @@ from control.gamepad_control import GamepadController
 DEFAULT_CAMERA = 0  # 摄像头索引（默认 0）
 DEFAULT_WIDTH = 640  # 期望宽度
 DEFAULT_HEIGHT = 480  # 期望高度
-DEFAULT_FPS = 120  # 期望帧率
+DEFAULT_FPS = 60  # 期望帧率（120 在 USB2 MJPEG 下易触发 Corrupt JPEG / 超时）
 DEFAULT_DISPLAY = 1
+DEFAULT_CAMERA_READ_FAILS = 3  # 连续读失败多少次后重开摄像头
+DEFAULT_CAMERA_REOPEN_DELAY_S = 0.5
 
 # 控制默认参数（可通过命令行覆盖）
 DEFAULT_MAX_RPM = 20.0
@@ -52,6 +55,10 @@ def parse_args():
     p.add_argument('--camera', type=int, default=DEFAULT_CAMERA, help=f'摄像头索引（默认 {DEFAULT_CAMERA}）')
     p.add_argument('--display', type=int, choices=[0, 1], default=DEFAULT_DISPLAY,
                    help=f'是否显示图形化窗口（0/1，默认 {DEFAULT_DISPLAY}）')
+    p.add_argument('--fps', type=float, default=DEFAULT_FPS,
+                   help=f'摄像头期望帧率（默认 {DEFAULT_FPS}）')
+    p.add_argument('--width', type=int, default=DEFAULT_WIDTH, help=f'期望宽度（默认 {DEFAULT_WIDTH}）')
+    p.add_argument('--height', type=int, default=DEFAULT_HEIGHT, help=f'期望高度（默认 {DEFAULT_HEIGHT}）')
 
     # 控制相关
     p.add_argument('--max-rpm', type=float, default=DEFAULT_MAX_RPM,
@@ -74,29 +81,95 @@ def parse_args():
     return p.parse_args()
 
 
+def _force_v4l2_fps(camera_index: int, fps: float) -> None:
+    """Some UVC cams ignore OpenCV CAP_PROP_FPS; set via v4l2-ctl when available."""
+    if not sys.platform.startswith("linux"):
+        return
+    device = f"/dev/video{camera_index}"
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["v4l2-ctl", "-d", device, f"--set-parm={fps:g}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            msg = (result.stdout or result.stderr or "").strip()
+            print(f"info: v4l2-ctl set-parm {fps:g} on {device}" + (f" ({msg})" if msg else ""))
+        else:
+            err = (result.stderr or result.stdout or "").strip()
+            print(f"警告: v4l2-ctl 设置帧率失败: {err or result.returncode}")
+    except FileNotFoundError:
+        print("警告: 未安装 v4l2-ctl，无法强制摄像头帧率（可 apt install v4l-utils）")
+    except Exception as exc:
+        print(f"警告: 强制设置帧率异常: {exc}")
+
+
+def open_camera(camera_index: int, width: int, height: int, fps: float) -> cv2.VideoCapture:
+    """Open and configure the capture device."""
+    if sys.platform.startswith('linux'):
+        cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+    elif sys.platform.startswith('win'):
+        cap = cv2.VideoCapture(camera_index, cv2.CAP_MSMF)
+    else:
+        cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        return cap
+
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FPS, fps)
+    # 尽量只保留最新帧，减轻处理跟不上时的缓冲堆积
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    _force_v4l2_fps(camera_index, fps)
+    return cap
+
+
+def reopen_camera(
+    cap: cv2.VideoCapture | None,
+    camera_index: int,
+    width: int,
+    height: int,
+    fps: float,
+    delay_s: float = DEFAULT_CAMERA_REOPEN_DELAY_S,
+) -> cv2.VideoCapture | None:
+    """Release and reopen the camera after a stream failure."""
+    print(f"警告: 摄像头读帧失败，{delay_s:.1f}s 后尝试重连...")
+    if cap is not None:
+        try:
+            cap.release()
+        except Exception:
+            pass
+    time.sleep(delay_s)
+    new_cap = open_camera(camera_index, width, height, fps)
+    if not new_cap.isOpened():
+        print(f"警告: 摄像头重连失败 (index={camera_index})")
+        try:
+            new_cap.release()
+        except Exception:
+            pass
+        return None
+    print(
+        f"info: 摄像头已重连 backend={new_cap.getBackendName()} "
+        f"{new_cap.get(cv2.CAP_PROP_FRAME_WIDTH):.0f}x{new_cap.get(cv2.CAP_PROP_FRAME_HEIGHT):.0f} "
+        f"@ {new_cap.get(cv2.CAP_PROP_FPS):.1f} fps"
+    )
+    return new_cap
+
+
 def main():
     args = parse_args()
 
-    # 根据系统环境选择后端
-    if sys.platform.startswith('linux'):
-        cap = cv2.VideoCapture(args.camera, cv2.CAP_V4L2)
-    elif sys.platform.startswith('win'):
-        cap = cv2.VideoCapture(args.camera, cv2.CAP_MSMF)
-    else:
-        cap = cv2.VideoCapture(args.camera)
+    cap = open_camera(args.camera, args.width, args.height, args.fps)
     if not cap.isOpened():
         print(f"无法打开摄像头索引 {args.camera}. 请检查设备或更换索引。")
         sys.exit(2)
 
-    # 设置参数
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G')) # 设置为 MJPG 格式
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, DEFAULT_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, DEFAULT_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, DEFAULT_FPS)
     print(f"info: capture backend: {cap.getBackendName()}")
     print(f"info: capture resolution: {cap.get(cv2.CAP_PROP_FRAME_WIDTH)}x{cap.get(cv2.CAP_PROP_FRAME_HEIGHT)}")
     print(f"info: capture FPS: {cap.get(cv2.CAP_PROP_FPS)}")
-
     # 控制器初始化
     tracker = GimbalTracker(
         yaw_pid=PID(kp=140.0, ki=40.0, kd=1.4, integral_limit=0.15, output_limit=args.max_rpm),
@@ -134,6 +207,7 @@ def main():
     serial_stub.send_command(serial_stub.CmdType.Enable)  # 启用云台
 
     key = 255
+    consecutive_read_fails = 0
 
     def toggle_manual_mode():
         nonlocal manual_mode
@@ -150,12 +224,27 @@ def main():
 
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                print("无法从摄像头读取到帧，正在重试...")
-                time.sleep(0.1)
+            if cap is None or not cap.isOpened():
+                serial_stub.send_command(serial_stub.CmdType.LowSpeedCtrl, (0.0, 0.0))
+                cap = reopen_camera(cap, args.camera, args.width, args.height, args.fps)
+                consecutive_read_fails = 0
+                if cap is None:
+                    time.sleep(DEFAULT_CAMERA_REOPEN_DELAY_S)
                 continue
 
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                consecutive_read_fails += 1
+                print(f"无法从摄像头读取到帧 ({consecutive_read_fails}/{DEFAULT_CAMERA_READ_FAILS})...")
+                serial_stub.send_command(serial_stub.CmdType.LowSpeedCtrl, (0.0, 0.0))
+                if consecutive_read_fails >= DEFAULT_CAMERA_READ_FAILS:
+                    cap = reopen_camera(cap, args.camera, args.width, args.height, args.fps)
+                    consecutive_read_fails = 0
+                else:
+                    time.sleep(0.05)
+                continue
+
+            consecutive_read_fails = 0
             frame = cv2.flip(frame, -1)  # 翻转画面
 
             gp_events = gamepad.update() if gamepad is not None else None
@@ -207,7 +296,8 @@ def main():
     except KeyboardInterrupt:
         print('\n收到中断，退出...')
     finally:
-        cap.release()
+        if cap is not None:
+            cap.release()
         if gamepad is not None:
             gamepad.close()
         serial_stub.close()
