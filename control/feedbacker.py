@@ -5,7 +5,7 @@ import time
 from typing import Tuple
 
 import cv2
-from vision.rect_detect import draw_detected_rect
+from vision.detectors import DetectedTarget
 
 
 def get_fps():
@@ -42,23 +42,22 @@ class Feedbacker:
     def close(self):
         self.__del__()
 
-    def update(self, frame, rect,
+    def update(self, frame, target: DetectedTarget | None,
                center_pixel: Tuple[int, int],
                error_pixel: Tuple[float, float],
                yaw_pitch_rpm: Tuple[float, float] | None,
                mode: str = "auto",
+               detect_mode: str = "rect",
                ) -> int:
         """Draw/print feedback. Returns key code (0xFF mask), or 255 if none."""
         fps = get_fps()
         err_x, err_y = error_pixel
         yaw_rpm, pitch_rpm = yaw_pitch_rpm if yaw_pitch_rpm is not None else (0.0, 0.0)
         if self.display:
-            if rect is not None:
-                draw_detected_rect(frame, rect)
             # 画面中心点
             cv2.drawMarker(frame, center_pixel, (255, 0, 0),
                            markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
-            cv2.putText(frame, f"FPS: {fps:.1f}  [{mode}]", (10, 30),
+            cv2.putText(frame, f"FPS: {fps:.1f}  [{mode}]  detect={detect_mode}", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
             cv2.putText(
                 frame,
@@ -69,8 +68,8 @@ class Feedbacker:
                 (0, 255, 255),
                 2,
             )
-            hint = "Start/m:mode  stick/WASD:move  A/space:stop  Back/q:quit" if mode == "manual" \
-                else "Start/m:manual  Back/q:quit"
+            hint = "1/2/3:detect  m:mode  WASD:move  space:stop  q:quit" if mode == "manual" \
+                else "1/2/3:detect  m:manual  q:quit"
             cv2.putText(frame, hint, (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
             cv2.imshow(self._window_name, frame)
             # waitKeyEx：兼容方向键；无按键时可能为 -1
@@ -80,12 +79,14 @@ class Feedbacker:
             # 无窗口：终端输出 FPS + 检测结果
             if (time.time() - self._last_print) >= 0.05:
                 self._last_print = time.time()
-                if rect is None:
-                    print(f"fps={fps:.1f} mode={mode} rect=none rpm=({yaw_rpm:.1f},{pitch_rpm:.1f})")
+                if target is None:
+                    print(f"fps={fps:.1f} mode={mode} detect={detect_mode} target=none "
+                          f"rpm=({yaw_rpm:.1f},{pitch_rpm:.1f})")
                 else:
-                    cx, cy = rect.center
+                    cx, cy = target.center
                     print(
-                        f"fps={fps:.1f} mode={mode} cx={cx:.1f} cy={cy:.1f} area={rect.area:.0f} "
+                        f"fps={fps:.1f} mode={mode} detect={detect_mode} "
+                        f"cx={cx:.1f} cy={cy:.1f} area={target.area:.0f} "
                         f"err=({err_x:.0f},{err_y:.0f}) rpm=({yaw_rpm:.1f},{pitch_rpm:.1f})"
                     )
             return 255

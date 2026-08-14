@@ -6,6 +6,8 @@
 参数：
   --camera / --fps / --width / --height  采集参数（默认 640x480 @ 60fps）
   --display       是否显示图形化窗口（0/1，默认 1）
+  --detect-mode   检测模式：rect / circle / object（默认 rect）
+  --object-ref    物体检测的参考图像路径（detect-mode=object 时必需）
   --manual        启动时进入手动控制模式
   --manual-rpm    手动模式转速上限（RPM）
   --gamepad / --no-gamepad  启用/禁用 USB 手柄（默认启用并自动探测）
@@ -13,6 +15,7 @@
 控制：
   GUI 模式按 'q' 或 ESC 退出；无窗口模式请按 Ctrl+C 退出。
   按 'm' 或手柄 Start 在自动追踪 / 手动控制之间切换。
+  按 '1' / '2' / '3' 切换检测模式：矩形 / 圆形 / 物体。
   手动模式：
     - 手柄左摇杆 / 方向键：yaw / pitch（比例控制）
     - 手柄 A：急停；Back：退出
@@ -26,7 +29,7 @@ import sys
 
 import cv2
 
-from vision.rect_detect import detect_rectangles
+from vision.detectors import create_detector, DetectionMode, BaseDetector, DetectedTarget
 
 from control.pid import PID
 from control.feedbacker import Feedbacker
@@ -48,6 +51,9 @@ DEFAULT_MAX_RPM = 20.0
 DEFAULT_LOST_TIMEOUT_S = 0.4
 DEFAULT_MANUAL_RPM = 1
 DEFAULT_GAMEPAD_DEADZONE = 0.12
+
+# 检测默认参数
+DEFAULT_DETECT_MODE = "rect"
 
 
 def parse_args():
@@ -77,6 +83,21 @@ def parse_args():
     p.add_argument('--gamepad-index', type=int, default=0, help='手柄设备索引（默认 0）')
     p.add_argument('--gamepad-deadzone', type=float, default=DEFAULT_GAMEPAD_DEADZONE,
                    help=f'摇杆死区 0~1（默认 {DEFAULT_GAMEPAD_DEADZONE}）')
+
+    # 检测相关
+    p.add_argument('--detect-mode', type=str, choices=['rect', 'circle', 'object'],
+                   default=DEFAULT_DETECT_MODE,
+                   help=f'目标检测模式（默认 {DEFAULT_DETECT_MODE}）')
+    p.add_argument('--object-ref', type=str, default=None,
+                   help='物体检测的参考图像路径（detect-mode=object 时必需）')
+    p.add_argument('--circle-min-circularity', type=float, default=0.7,
+                   help='圆形检测最小圆度 0~1（默认 0.7）')
+    p.add_argument('--circle-min-radius', type=int, default=10,
+                   help='圆形检测最小半径（像素，默认 10）')
+    p.add_argument('--circle-max-radius', type=int, default=300,
+                   help='圆形检测最大半径（像素，默认 300）')
+    p.add_argument('--object-min-matches', type=int, default=10,
+                   help='ORB 匹配最小特征点数（默认 10）')
 
     return p.parse_args()
 
@@ -199,7 +220,44 @@ def main():
 
     tracker.enabled = not manual_mode
     mode_name = "manual" if manual_mode else "auto"
+
+    # 检测器初始化
+    detector: BaseDetector | None = None
+    detect_mode = args.detect_mode
+
+    def set_detect_mode(new_mode: str) -> bool:
+        nonlocal detector, detect_mode
+        try:
+            new_detector = create_detector(
+                DetectionMode(new_mode),
+                rect_min_area_ratio=0.005,
+                rect_max_area_ratio=0.5,
+                rect_angle_tol=25.0,
+                circle_min_area_ratio=0.005,
+                circle_max_area_ratio=0.5,
+                circle_min_circularity=args.circle_min_circularity,
+                circle_min_radius=args.circle_min_radius,
+                circle_max_radius=args.circle_max_radius,
+                object_ref_path=args.object_ref,
+                object_min_matches=args.object_min_matches,
+            )
+            detector = new_detector
+            detect_mode = new_mode
+            print(f"切换到 {new_mode} 检测模式")
+            return True
+        except Exception as exc:
+            print(f"警告: 无法切换到 {new_mode} 检测模式: {exc}")
+            return False
+
+    if not set_detect_mode(detect_mode):
+        print("错误: 检测器初始化失败，退出")
+        serial_stub.close()
+        feedbacker.close()
+        cap.release()
+        sys.exit(2)
+
     print(f"info: control mode = {mode_name}  (键盘 m / 手柄 Start 切换)")
+    print(f"info: detect mode = {detect_mode}  (键盘 1/2/3 切换)")
     print("info: 手动: 手柄左摇杆 或 WASD；A/空格急停；q/Back 退出")
 
     serial_stub.send_command(serial_stub.CmdType.EnableLaser)  # 启用激光
@@ -217,6 +275,8 @@ def main():
         manual.reset()
         if gamepad is not None:
             gamepad.reset()
+        if detector is not None:
+            detector.reset()
         serial_stub.send_command(serial_stub.CmdType.LowSpeedCtrl, (0.0, 0.0))
         print(f"切换到 {'手动' if manual_mode else '自动追踪'} 模式")
         if manual_mode and not args.display and gamepad is None:
@@ -258,10 +318,10 @@ def main():
                     manual.reset()
                     serial_stub.send_command(serial_stub.CmdType.LowSpeedCtrl, (0.0, 0.0))
 
-            # 对每帧执行矩形检测（自动模式用于追踪，手动模式仅用于叠加显示）
-            rects = detect_rectangles(frame, min_area_ratio=0.005, max_area_ratio=0.5, angle_tol=25.0)
-            best_rect = rects[0] if rects else None
-            best_rect_center = rects[0].center if rects else None
+            # 执行当前检测器（矩形 / 圆形 / 物体）
+            targets = detector.detect(frame) if detector is not None else []
+            best_target = targets[0] if targets else None
+            best_target_center = best_target.center if best_target is not None else None
 
             tracker.target_center = (frame.shape[:2][1] // 2 + 10, frame.shape[:2][0] // 2)
 
@@ -277,14 +337,19 @@ def main():
                 serial_stub.send_command(serial_stub.CmdType.LowSpeedCtrl, yaw_pitch_rpm)
             else:
                 # PID 控制：将目标中心追踪到屏幕中心，输出 yaw/pitch rpm
-                error_pixel, yaw_pitch_rpm = tracker.update(frame.shape[:2], best_rect_center)
+                error_pixel, yaw_pitch_rpm = tracker.update(frame.shape[:2], best_target_center)
                 if yaw_pitch_rpm is not None:
                     yaw_rpm, pitch_rpm = yaw_pitch_rpm
                     serial_stub.send_command(serial_stub.CmdType.LowSpeedCtrl, (yaw_rpm, pitch_rpm))
 
+            # 在画面上叠加检测框
+            if best_target is not None:
+                detector.draw(frame, best_target)
+
             mode_name = "manual" if manual_mode else "auto"
             key = feedbacker.update(
-                frame, best_rect, tracker.target_center, error_pixel, yaw_pitch_rpm, mode=mode_name
+                frame, best_target, tracker.target_center, error_pixel, yaw_pitch_rpm,
+                mode=mode_name, detect_mode=detect_mode,
             )
 
             if key in (ord('q'), ord('Q'), 27):  # q / ESC
@@ -292,6 +357,12 @@ def main():
                 break
             if key in (ord('m'), ord('M')):
                 toggle_manual_mode()
+            if key == ord('1'):
+                set_detect_mode('rect')
+            if key == ord('2'):
+                set_detect_mode('circle')
+            if key == ord('3'):
+                set_detect_mode('object')
 
     except KeyboardInterrupt:
         print('\n收到中断，退出...')
