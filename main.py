@@ -29,7 +29,7 @@ import sys
 
 import cv2
 
-from vision.detectors import create_detector, DetectionMode, BaseDetector, DetectedTarget
+from vision.detectors import create_detector, DetectionMode, BaseDetector
 
 from control.pid import PID
 from control.feedbacker import Feedbacker
